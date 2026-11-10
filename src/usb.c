@@ -54,14 +54,6 @@
 
 #define MAX_DEVICES 8
 
-/* TODO:
- *
- * AccessDevices()
- *  - Check if backend is returning appropriate device ids
- *  - Check if backend is not increasing permissions
- *  - Save allowed devices in the permission store
- */
-
 struct _XdpUsb
 {
   XdpDbusUsbSkeleton parent_instance;
@@ -935,6 +927,57 @@ handle_enumerate_devices (XdpDbusUsb            *object,
   return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
+/* Validate the complete backend grant before persisting any permission or
+ * pending acquisition. Device IDs and access modes remain caller-owned bounds.
+ */
+static gboolean
+validate_acquired_devices (GVariant *requested,
+                           GVariant *granted)
+{
+  g_autoptr(GHashTable) offered =
+    g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  g_autoptr(GHashTable) seen =
+    g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  GVariantIter iter;
+  const char *device_id;
+  GVariant *info;
+  GVariant *options;
+
+  g_variant_iter_init (&iter, requested);
+  while (g_variant_iter_next (&iter, "(&s@a{sv}@a{sv})", &device_id, &info, &options))
+    {
+      g_autoptr(GVariant) owned_info = info;
+      g_autoptr(GVariant) owned_options = options;
+      gboolean writable = FALSE;
+      guint previous = GPOINTER_TO_UINT (g_hash_table_lookup (offered, device_id));
+
+      g_variant_lookup (options, "writable", "b", &writable);
+      g_hash_table_replace (offered, g_strdup (device_id),
+                            GUINT_TO_POINTER (writable || previous == 2 ? 2 : 1));
+    }
+
+  if (g_variant_n_children (granted) > g_hash_table_size (offered))
+    return FALSE;
+
+  g_variant_iter_init (&iter, granted);
+  while (g_variant_iter_next (&iter, "(&s@a{sv})", &device_id, &options))
+    {
+      g_autoptr(GVariant) owned_options = options;
+      g_autoptr(GVariant) writable = g_variant_lookup_value (options, "writable", NULL);
+      guint requested_mode = GPOINTER_TO_UINT (g_hash_table_lookup (offered, device_id));
+
+      if (requested_mode == 0 || g_hash_table_contains (seen, device_id))
+        return FALSE;
+      if (writable &&
+          (!g_variant_is_of_type (writable, G_VARIANT_TYPE_BOOLEAN) ||
+           (g_variant_get_boolean (writable) && requested_mode != 2)))
+        return FALSE;
+      g_hash_table_add (seen, g_strdup (device_id));
+    }
+
+  return TRUE;
+}
+
 static void
 usb_acquire_devices_cb (GObject      *source_object,
                         GAsyncResult *result,
@@ -946,6 +989,7 @@ usb_acquire_devices_cb (GObject      *source_object,
   g_autoptr(GVariantIter) devices_iter = NULL;
   g_auto(GVariantBuilder) results_builder;
   g_autoptr (GVariant) results = NULL;
+  g_autoptr(GVariant) granted = NULL;
   g_autoptr(XdpRequest) request = data;
   g_autoptr(GError) error = NULL;
   GVariant *options;
@@ -977,16 +1021,17 @@ usb_acquire_devices_cb (GObject      *source_object,
   sender_info = usb_sender_info_from_request (request);
   g_assert (sender_info != NULL);
 
-  /* TODO: check if the list of devices that the backend reported is strictly
-   * equal or a subset of the devices the app requested. */
-
-  /* TODO: check if we're strictly equal or downgrading the "writable" option */
-
-  if (!g_variant_lookup (results, "devices", "a(sa{sv})", &devices_iter))
-    goto out;
-
   if (response == XDG_DESKTOP_PORTAL_RESPONSE_SUCCESS)
     {
+      GVariant *requested = g_object_get_data (G_OBJECT (request), "usb-requested-devices");
+
+      granted = g_variant_lookup_value (results, "devices", G_VARIANT_TYPE ("a(sa{sv})"));
+      if (!granted || !validate_acquired_devices (requested, granted))
+        {
+          response = XDG_DESKTOP_PORTAL_RESPONSE_OTHER;
+          goto out;
+        }
+      devices_iter = g_variant_iter_new (granted);
       g_autoptr(GPtrArray) pending_devices =
         g_ptr_array_new_full (g_variant_iter_n_children (devices_iter),
                               (GDestroyNotify) usb_device_acquire_data_free);
@@ -1233,6 +1278,8 @@ handle_acquire_devices (XdpDbusUsb            *object,
 
   g_object_set_data_full (G_OBJECT (request), "usb",
                           g_object_ref (self), g_object_unref);
+  g_object_set_data_full (G_OBJECT (request), "usb-requested-devices",
+                          g_variant_ref (filtered_devices), (GDestroyNotify) g_variant_unref);
 
   xdp_dbus_impl_usb_call_acquire_devices (self->impl,
                                           request->id,
