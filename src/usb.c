@@ -176,16 +176,6 @@ usb_device_acquire_data_free (UsbDeviceAcquireData *acquire_data)
   g_clear_pointer (&acquire_data, g_free);
 }
 
-static UsbOwnedDevice *
-usb_owned_device_ref (UsbOwnedDevice *owned_device)
-{
-  g_return_val_if_fail (owned_device != NULL, NULL);
-
-  g_atomic_ref_count_inc (&owned_device->ref_count);
-
-  return owned_device;
-}
-
 static void
 usb_owned_device_unref (UsbOwnedDevice *owned_device)
 {
@@ -1431,18 +1421,14 @@ handle_finish_acquire_devices (XdpDbusUsb            *object,
           continue;
         }
 
-      /* This sender now owns this device. Either create a new one
-       * or ref the existing one.
+      /* The sender map owns exactly one cached descriptor per device. Client
+       * copies already transferred by D-Bus remain the client's responsibility.
        */
       if (!owned_device)
         {
           usb_sender_info_acquire_device (sender_info,
                                           access_data->device_id,
                                           g_steal_fd (&fd));
-        }
-      else
-        {
-          usb_owned_device_ref (owned_device);
         }
 
       g_variant_dict_insert (&dict, "success", "b", TRUE);
