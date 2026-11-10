@@ -955,10 +955,6 @@ usb_acquire_devices_cb (GObject      *source_object,
 
   response = XDG_DESKTOP_PORTAL_RESPONSE_OTHER;
   usb = g_object_get_data (G_OBJECT (request), "usb");
-  sender_info = usb_sender_info_from_request (request);
-
-  g_assert (sender_info != NULL);
-
   g_variant_builder_init (&results_builder, G_VARIANT_TYPE_VARDICT);
 
   if (!xdp_dbus_impl_usb_call_acquire_devices_finish (usb->impl,
@@ -971,6 +967,15 @@ usb_acquire_devices_cb (GObject      *source_object,
       g_dbus_error_strip_remote_error (error);
       goto out;
     }
+
+  /* Close or caller loss may have won while the backend was deciding. A late
+   * success must not create permissions or a finishable acquisition.
+   */
+  if (!request->exported)
+    goto out;
+
+  sender_info = usb_sender_info_from_request (request);
+  g_assert (sender_info != NULL);
 
   /* TODO: check if the list of devices that the backend reported is strictly
    * equal or a subset of the devices the app requested. */
