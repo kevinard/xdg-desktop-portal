@@ -340,7 +340,7 @@ xdp_session_initable_init (GInitable     *initable,
                                               id,
                                               NULL, error);
       if (!impl_session)
-        return FALSE;
+        goto fail_claim;
 
       g_signal_connect_object (impl_session, "closed",
                                G_CALLBACK (on_closed),
@@ -364,6 +364,10 @@ xdp_session_initable_init (GInitable     *initable,
                            G_CONNECT_DEFAULT);
 
   return TRUE;
+
+fail_claim:
+  xdp_context_unclaim_object_path (session->context, id);
+  return FALSE;
 }
 
 static void
