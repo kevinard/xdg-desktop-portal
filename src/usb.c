@@ -1391,7 +1391,7 @@ handle_finish_acquire_devices (XdpDbusUsb            *object,
           const char *device_file = g_udev_device_get_device_file (device);
 
           g_assert (device_file != NULL);
-          fd = open (device_file, access_data->writable ? O_RDWR : O_RDONLY);
+          fd = open (device_file, (access_data->writable ? O_RDWR : O_RDONLY) | O_CLOEXEC);
           if (fd == -1)
             {
               g_variant_dict_insert (&dict, "success", "b", FALSE);
