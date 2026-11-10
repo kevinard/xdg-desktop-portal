@@ -27,6 +27,8 @@ typedef enum _XdpContextExportFlags
 {
   XDP_CONTEXT_EXPORT_FLAGS_NONE = 0,
   XDP_CONTEXT_EXPORT_FLAGS_HOST_PORTAL = (1 << 0),
+  /* The portal provides its own authorization and dispatch contexts. */
+  XDP_CONTEXT_EXPORT_FLAGS_CUSTOM_DISPATCH = (1 << 1),
 } XdpContextExportFlags;
 
 #define XDP_TYPE_CONTEXT (xdp_context_get_type())
@@ -52,6 +54,10 @@ XdpPortalConfig * xdp_context_get_config (XdpContext *context);
 XdpDbusImplLockdown * xdp_context_get_lockdown_impl (XdpContext *context);
 
 XdpDbusImplAccess * xdp_context_get_access_impl (XdpContext *context);
+
+gboolean xdp_context_authorize_invocation (XdpContext *context,
+                                            GDBusMethodInvocation *invocation,
+                                            gboolean cached_only);
 
 void xdp_context_take_and_export_portal (XdpContext             *context,
                                          GDBusInterfaceSkeleton *skeleton,
