@@ -77,7 +77,7 @@ xdp_session_from_request (const char *session_handle,
     g_object_ref (session);
   G_UNLOCK (sessions);
 
-  if (!session)
+  if (!session || g_atomic_int_get (&session->impl_owner_lost))
     return NULL;
 
   if (g_strcmp0 (session->sender, request->sender) != 0)
@@ -101,7 +101,7 @@ xdp_session_from_app_info (const char *session_handle,
     g_object_ref (session);
   G_UNLOCK (sessions);
 
-  if (!session)
+  if (!session || g_atomic_int_get (&session->impl_owner_lost))
     return NULL;
 
   if (g_strcmp0 (session->sender, xdp_app_info_get_sender (app_info)) != 0)
@@ -124,6 +124,9 @@ xdp_session_lookup (const char *session_handle)
     g_object_ref (session);
   G_UNLOCK (sessions);
 
+  if (session && g_atomic_int_get (&session->impl_owner_lost))
+    return NULL;
+
   return g_steal_pointer (&session);
 }
 
@@ -131,6 +134,27 @@ gboolean
 xdp_session_export (XdpSession  *session,
                     GError     **error)
 {
+  if (session->closed)
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_CLOSED,
+                           "Session is already closed");
+      return FALSE;
+    }
+
+  if (session->impl_name_watch)
+    {
+      g_autofree char *owner =
+        g_dbus_proxy_get_name_owner (session->impl_name_watch);
+
+      if (g_atomic_int_get (&session->impl_owner_lost) ||
+          g_strcmp0 (owner, session->impl_owner) != 0)
+        {
+          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_CLOSED,
+                               "Session backend owner has changed");
+          return FALSE;
+        }
+    }
+
   if (!g_dbus_interface_skeleton_export (G_DBUS_INTERFACE_SKELETON (session),
                                          session->connection,
                                          session->id,
@@ -139,6 +163,7 @@ xdp_session_export (XdpSession  *session,
 
   g_object_ref (session);
   session->exported = TRUE;
+  g_atomic_int_set (&session->impl_was_exported, TRUE);
 
   return TRUE;
 }
@@ -174,6 +199,10 @@ xdp_session_close (XdpSession *session,
   if (session->closed)
     return;
 
+  session->closed = TRUE;
+  g_atomic_int_set (&session->impl_owner_lost, TRUE);
+  g_clear_object (&session->impl_name_watch);
+
   XDP_SESSION_GET_CLASS (session)->close (session);
 
   if (notify_closed)
@@ -208,9 +237,6 @@ xdp_session_close (XdpSession *session,
       g_clear_object (&session->impl_session);
     }
 
-  session->closed = TRUE;
-
-
   g_object_unref (session);
 }
 
@@ -243,7 +269,87 @@ on_closed (XdpDbusImplSession *object, GObject *data)
   SESSION_AUTOLOCK_UNREF (g_object_ref (session));
 
   g_clear_object (&session->impl_session);
-  xdp_session_close (session, TRUE);
+  xdp_session_close (session, session->exported);
+}
+
+static void
+close_orphan_done (GObject      *source_object,
+                   GAsyncResult *res,
+                   gpointer      user_data)
+{
+  g_autoptr(GVariant) reply = NULL;
+  g_autoptr(GError) error = NULL;
+
+  reply = g_dbus_connection_call_finish (G_DBUS_CONNECTION (source_object), res, &error);
+  if (!reply)
+    g_debug ("Orphaned backend session cleanup: %s", error->message);
+}
+
+static void
+close_orphan (XdpSession *session)
+{
+  /* A replaced owner may still be alive and controlling input. Retire that
+   * unique owner, never the process which now owns the well-known name. Do not
+   * hold up public session revocation if the old backend is unresponsive. */
+  g_dbus_connection_call (session->impl_connection,
+                          session->impl_owner,
+                          session->id,
+                          "org.freedesktop.impl.portal.Session", "Close",
+                          NULL, G_VARIANT_TYPE_UNIT,
+                          G_DBUS_CALL_FLAGS_NO_AUTO_START,
+                          5000, NULL, close_orphan_done, NULL);
+}
+
+static void
+close_lost_owner_in_thread (GTask        *task,
+                            gpointer      source_object,
+                            gpointer      task_data,
+                            GCancellable *cancellable)
+{
+  XdpSession *session = XDP_SESSION (source_object);
+
+  {
+    SESSION_AUTOLOCK (session);
+
+    /* A creation callback rejects the latched loss before export and retires
+     * its session only after the outstanding backend create has finished. */
+    if (!session->closed && session->exported)
+      {
+        if (!GPOINTER_TO_INT (task_data))
+          close_orphan (session);
+        g_clear_object (&session->impl_session);
+        xdp_session_close (session, TRUE);
+      }
+  }
+
+  g_task_return_boolean (task, TRUE);
+}
+
+static void
+on_impl_name_owner_changed (GDBusProxy *proxy,
+                            GParamSpec *pspec,
+                            XdpSession *session)
+{
+  g_autofree char *owner = g_dbus_proxy_get_name_owner (proxy);
+  g_autoptr(GTask) task = NULL;
+  gboolean cleanup_sent;
+
+  if (g_strcmp0 (owner, session->impl_owner) == 0)
+    return;
+
+  /* Latch once, including a loss followed by reacquisition before create ends.
+   * Admission rejects further use immediately. Never wait for a session lock
+   * on the frontend loop: a synchronous backend call may still hold it. */
+  if (!g_atomic_int_compare_and_exchange (&session->impl_owner_lost, FALSE, TRUE))
+    return;
+
+  cleanup_sent = g_atomic_int_get (&session->impl_was_exported);
+  if (cleanup_sent)
+    close_orphan (session);
+
+  task = g_task_new (session, NULL, NULL, NULL);
+  g_task_set_task_data (task, GINT_TO_POINTER (cleanup_sent), NULL);
+  g_task_run_in_thread (task, close_lost_owner_in_thread);
 }
 
 static gboolean
@@ -289,6 +395,8 @@ xdp_session_initable_init (GInitable     *initable,
   XdpSession *session = XDP_SESSION (initable);
   g_autofree char *sender_escaped = NULL;
   g_autofree char *id = NULL;
+  g_autofree char *impl_owner = NULL;
+  g_autoptr(XdpDbusImplSession) impl_name_watch = NULL;
   g_autoptr(XdpDbusImplSession) impl_session = NULL;
   int i;
 
@@ -333,10 +441,29 @@ xdp_session_initable_init (GInitable     *initable,
 
   if (session->impl_dbus_name)
     {
+      impl_name_watch =
+        xdp_dbus_impl_session_proxy_new_sync (session->impl_connection,
+                                              G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES |
+                                              G_DBUS_PROXY_FLAGS_DO_NOT_CONNECT_SIGNALS,
+                                              session->impl_dbus_name,
+                                              id,
+                                              NULL, error);
+      if (!impl_name_watch)
+        goto fail_claim;
+
+      impl_owner = g_dbus_proxy_get_name_owner (G_DBUS_PROXY (impl_name_watch));
+      if (!impl_owner)
+        {
+          g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_CLOSED,
+                               "Session backend has no owner");
+          goto fail_claim;
+        }
+
       impl_session =
         xdp_dbus_impl_session_proxy_new_sync (session->impl_connection,
-                                              G_DBUS_PROXY_FLAGS_NONE,
-                                              session->impl_dbus_name,
+                                              G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES |
+                                              G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START,
+                                              impl_owner,
                                               id,
                                               NULL, error);
       if (!impl_session)
@@ -348,6 +475,12 @@ xdp_session_initable_init (GInitable     *initable,
                                G_CONNECT_DEFAULT);
 
       session->impl_session = g_steal_pointer (&impl_session);
+      session->impl_owner = g_steal_pointer (&impl_owner);
+      session->impl_name_watch = G_DBUS_PROXY (g_steal_pointer (&impl_name_watch));
+      g_signal_connect_object (session->impl_name_watch, "notify::g-name-owner",
+                               G_CALLBACK (on_impl_name_owner_changed),
+                               session,
+                               G_CONNECT_DEFAULT);
     }
 
   session->id = g_steal_pointer (&id);
@@ -468,6 +601,8 @@ xdp_session_finalize (GObject *object)
 
   g_clear_object (&session->impl_connection);
   g_free (session->impl_dbus_name);
+  g_free (session->impl_owner);
+  g_clear_object (&session->impl_name_watch);
   g_clear_object (&session->impl_session);
 
   g_free (session->app_id);
