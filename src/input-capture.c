@@ -1129,8 +1129,6 @@ handle_enable (XdpDbusInputCapture   *object,
       return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
-  input_capture_session->state = INPUT_CAPTURE_SESSION_STATE_ENABLED;
-
   /* Let's be lenient and make Enable() a noop for anything but a disabled
    * session.
    */
