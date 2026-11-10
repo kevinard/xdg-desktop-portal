@@ -218,25 +218,29 @@ method_needs_request (GDBusMethodInvocation *invocation)
   return method_info ?  method_info->uses_request : TRUE;
 }
 
-static gboolean
-authorize_callback (GDBusInterfaceSkeleton *interface,
-                    GDBusMethodInvocation  *invocation,
-                    gpointer                user_data)
+gboolean
+xdp_context_authorize_invocation (XdpContext *context,
+                                  GDBusMethodInvocation *invocation,
+                                  gboolean cached_only)
 {
-  XdpContext *context = XDP_CONTEXT (user_data);
   g_autoptr(XdpAppInfo) app_info = NULL;
   g_autoptr(GError) error = NULL;
 
-  app_info = xdp_app_info_registry_ensure_for_invocation_sync (context->app_info_registry,
-                                                               invocation,
-                                                               NULL,
-                                                               &error);
+  if (cached_only)
+    app_info = xdp_app_info_registry_lookup_sender (context->app_info_registry,
+                                                    g_dbus_method_invocation_get_sender (invocation));
+  else
+    app_info = xdp_app_info_registry_ensure_for_invocation_sync (context->app_info_registry,
+                                                                 invocation,
+                                                                 NULL,
+                                                                 &error);
   if (app_info == NULL)
     {
       g_dbus_method_invocation_return_error (invocation,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_ACCESS_DENIED,
-                                             "Portal operation not allowed: %s", error->message);
+                                             "Portal operation not allowed: %s",
+                                             error ? error->message : "Caller has no initialized portal identity");
       return FALSE;
     }
 
@@ -255,6 +259,14 @@ authorize_callback (GDBusInterfaceSkeleton *interface,
   return TRUE;
 }
 
+static gboolean
+authorize_callback (GDBusInterfaceSkeleton *interface,
+                    GDBusMethodInvocation *invocation,
+                    gpointer user_data)
+{
+  return xdp_context_authorize_invocation (XDP_CONTEXT (user_data), invocation, FALSE);
+}
+
 void
 xdp_context_take_and_export_portal (XdpContext             *context,
                                     GDBusInterfaceSkeleton *skeleton_,
@@ -269,7 +281,8 @@ xdp_context_take_and_export_portal (XdpContext             *context,
 
   name = g_dbus_interface_skeleton_get_info (skeleton)->name;
 
-  if (!(flags & XDP_CONTEXT_EXPORT_FLAGS_HOST_PORTAL))
+  if (!(flags & (XDP_CONTEXT_EXPORT_FLAGS_HOST_PORTAL |
+                  XDP_CONTEXT_EXPORT_FLAGS_CUSTOM_DISPATCH)))
     {
       /* Host portal dbus method invocations run in the main thread without yielding
        * to the main loop. This means that any later method call of any portal will

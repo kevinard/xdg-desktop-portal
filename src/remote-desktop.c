@@ -102,6 +102,13 @@ typedef struct _RemoteDesktopSession
 
   gboolean uses_eis;
 
+  /* Admission never waits for the session lock or a backend reply. */
+  GMutex input_mutex;
+  GQueue input_invocations;
+  guint input_devices;
+  gboolean input_running;
+  gboolean input_revoke;
+
   char *restore_token;
   XdpSessionPersistenceMode persist_mode;
   GVariant *restore_data;
@@ -114,7 +121,15 @@ typedef struct _RemoteDesktopSessionClass
 
 G_DEFINE_TYPE (RemoteDesktopSession, remote_desktop_session, xdp_session_get_type ())
 
-G_DEFINE_AUTOPTR_CLEANUP_FUNC (RemoteDesktopSession, g_object_unref);
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (RemoteDesktopSession, g_object_unref)
+
+static void
+remote_desktop_session_set_input_devices (RemoteDesktopSession *session, guint devices)
+{
+  G_MUTEX_AUTO_LOCK (&session->input_mutex, locker);
+  session->input_devices = devices;
+}
+;
 
 gboolean
 remote_desktop_session_can_select_sources (RemoteDesktopSession *session)
@@ -211,6 +226,7 @@ remote_desktop_session_close (XdpSession *session)
   RemoteDesktopSession *remote_desktop_session = REMOTE_DESKTOP_SESSION (session);
 
   remote_desktop_session->state = REMOTE_DESKTOP_SESSION_STATE_CLOSED;
+  remote_desktop_session_set_input_devices (remote_desktop_session, 0);
 
   g_debug ("remote desktop session owned by '%s' closed", session->sender);
 }
@@ -219,6 +235,9 @@ static void
 remote_desktop_session_finalize (GObject *object)
 {
   RemoteDesktopSession *remote_desktop_session = REMOTE_DESKTOP_SESSION (object);
+
+  g_assert (g_queue_is_empty (&remote_desktop_session->input_invocations));
+  g_mutex_clear (&remote_desktop_session->input_mutex);
 
   g_list_free_full (remote_desktop_session->streams,
                     (GDestroyNotify)screen_cast_stream_free);
@@ -231,6 +250,8 @@ remote_desktop_session_finalize (GObject *object)
 static void
 remote_desktop_session_init (RemoteDesktopSession *remote_desktop_session)
 {
+  g_mutex_init (&remote_desktop_session->input_mutex);
+  g_queue_init (&remote_desktop_session->input_invocations);
 }
 
 static void
@@ -745,6 +766,8 @@ start_done (GObject *source_object,
     {
       g_debug ("remote desktop session owned by '%s' started", session->sender);
       remote_desktop_session->state = REMOTE_DESKTOP_SESSION_STATE_STARTED;
+      remote_desktop_session_set_input_devices (remote_desktop_session,
+                                                 remote_desktop_session->shared_devices);
     }
 }
 
@@ -1612,6 +1635,7 @@ handle_connect_to_eis (XdpDbusRemoteDesktop *object,
     }
 
   remote_desktop_session->uses_eis = TRUE;
+  remote_desktop_session_set_input_devices (remote_desktop_session, 0);
 
   xdp_dbus_remote_desktop_complete_connect_to_eis (object, invocation, out_fd_list, fd);
   return G_DBUS_METHOD_INVOCATION_HANDLED;
@@ -1654,12 +1678,206 @@ remote_desktop_init (RemoteDesktop *remote_desktop)
 {
 }
 
+
+/* The connection loop admits input in receive order; each approved session has
+ * one worker. Other methods retain asynchronous authorization and dispatch. */
+#define MAX_PENDING_INPUTS 64
+#define MAX_INPUT_BYTES 4096
+
+static GDBusInterfaceMethodCallFunc parent_method_call;
+
+static void
+dispatch_original (RemoteDesktop *remote_desktop, GDBusMethodInvocation *invocation)
+{
+  parent_method_call (g_dbus_method_invocation_get_connection (invocation),
+                       g_dbus_method_invocation_get_sender (invocation),
+                       g_dbus_method_invocation_get_object_path (invocation),
+                       g_dbus_method_invocation_get_interface_name (invocation),
+                       g_dbus_method_invocation_get_method_name (invocation),
+                       g_dbus_method_invocation_get_parameters (invocation),
+                       invocation, remote_desktop);
+}
+
+typedef struct
+{
+  XdpContext *context;
+  GDBusMethodInvocation *invocation;
+} DeferredInvocation;
+
+static void
+deferred_invocation_free (gpointer data)
+{
+  DeferredInvocation *deferred = data;
+  g_clear_object (&deferred->context);
+  g_clear_object (&deferred->invocation);
+  g_free (deferred);
+}
+
+static void
+dispatch_method_worker (GTask *task, gpointer source, gpointer task_data,
+                         GCancellable *cancellable)
+{
+  DeferredInvocation *deferred = task_data;
+  GDBusMethodInvocation *invocation = g_steal_pointer (&deferred->invocation);
+
+  if (xdp_context_authorize_invocation (deferred->context, invocation, FALSE))
+    dispatch_original (source, invocation);
+  g_task_return_boolean (task, TRUE);
+}
+
+static void
+dispatch_input_worker (GTask *task, gpointer source, gpointer task_data,
+                        GCancellable *cancellable)
+{
+  RemoteDesktopSession *session = source;
+
+  for (;;)
+    {
+      GDBusMethodInvocation *invocation;
+      gboolean revoke;
+
+      g_mutex_lock (&session->input_mutex);
+      revoke = session->input_revoke;
+      session->input_revoke = FALSE;
+      invocation = g_queue_pop_head (&session->input_invocations);
+      if (!revoke && !invocation)
+        {
+          session->input_running = FALSE;
+          g_mutex_unlock (&session->input_mutex);
+          break;
+        }
+      g_mutex_unlock (&session->input_mutex);
+
+      if (revoke)
+        {
+          XdpSession *base = XDP_SESSION (session);
+          SESSION_AUTOLOCK (base);
+          xdp_session_close (base, TRUE);
+        }
+      if (invocation)
+        dispatch_original (session->remote_desktop, invocation);
+    }
+  g_task_return_boolean (task, TRUE);
+}
+
+static void
+queue_input (RemoteDesktop *remote_desktop, GDBusMethodInvocation *invocation)
+{
+  g_autoptr(XdpSession) base = NULL;
+  RemoteDesktopSession *session;
+  GVariant *parameters = g_dbus_method_invocation_get_parameters (invocation);
+  const char *method = g_dbus_method_invocation_get_method_name (invocation);
+  const char *handle;
+  GUnixFDList *fds;
+  guint wanted;
+  gboolean invalid_fds, revoke, start_worker;
+
+  /* A started session already initialized this caller's identity. Cache misses
+   * cannot authorize input, and must not trigger blocking metadata I/O here. */
+  if (!xdp_context_authorize_invocation (remote_desktop->context, invocation, TRUE))
+    return;
+  g_variant_get_child (parameters, 0, "&o", &handle);
+  base = xdp_session_from_app_info (handle, xdp_invocation_get_app_info (invocation));
+  if (!base || !IS_REMOTE_DESKTOP_SESSION (base))
+    {
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
+                                             G_DBUS_ERROR_ACCESS_DENIED, "Invalid session");
+      return;
+    }
+  session = REMOTE_DESKTOP_SESSION (base);
+  wanted = g_str_has_prefix (method, "NotifyKeyboard") ? DEVICE_TYPE_KEYBOARD :
+           g_str_has_prefix (method, "NotifyPointer") ? DEVICE_TYPE_POINTER :
+           DEVICE_TYPE_TOUCHSCREEN;
+  fds = g_dbus_message_get_unix_fd_list (g_dbus_method_invocation_get_message (invocation));
+  invalid_fds = fds && g_unix_fd_list_get_length (fds) != 0;
+
+  g_mutex_lock (&session->input_mutex);
+  if ((session->input_devices & wanted) == 0)
+    {
+      g_mutex_unlock (&session->input_mutex);
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
+                                             G_DBUS_ERROR_FAILED,
+                                             "Session is not allowed to send input notifications");
+      return;
+    }
+  revoke = invalid_fds || g_variant_get_size (parameters) > MAX_INPUT_BYTES ||
+           g_queue_get_length (&session->input_invocations) >= MAX_PENDING_INPUTS;
+  if (revoke)
+    {
+      /* In particular, never discard a release while leaving its grant active. */
+      session->input_devices = 0;
+      session->input_revoke = TRUE;
+    }
+  else
+    g_queue_push_tail (&session->input_invocations, invocation);
+  start_worker = !session->input_running;
+  session->input_running = TRUE;
+  g_mutex_unlock (&session->input_mutex);
+
+  if (start_worker)
+    {
+      g_autoptr(GTask) task = g_task_new (session, NULL, NULL, NULL);
+      g_task_set_task_data (task, g_object_ref (remote_desktop->context), g_object_unref);
+      g_task_run_in_thread (task, dispatch_input_worker);
+    }
+  if (revoke)
+    g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
+                                           invalid_fds ? G_DBUS_ERROR_INVALID_ARGS : G_DBUS_ERROR_LIMITS_EXCEEDED,
+                                           "Input notification exceeds its session budget");
+}
+
+static void
+remote_desktop_method_call (GDBusConnection *connection, const char *sender,
+                            const char *path, const char *interface, const char *method,
+                            GVariant *parameters, GDBusMethodInvocation *invocation,
+                            gpointer user_data)
+{
+  RemoteDesktop *remote_desktop = user_data;
+
+  if (g_strcmp0 (interface, "org.freedesktop.portal.RemoteDesktop") != 0)
+    {
+      g_dbus_method_invocation_return_error (invocation, G_DBUS_ERROR,
+                                             G_DBUS_ERROR_UNKNOWN_METHOD, "Remote desktop interface required");
+      return;
+    }
+  if (g_str_has_prefix (method, "Notify"))
+    queue_input (remote_desktop, invocation);
+  else
+    {
+      g_autoptr(GTask) task = g_task_new (remote_desktop, NULL, NULL, NULL);
+      DeferredInvocation *deferred = g_new0 (DeferredInvocation, 1);
+      deferred->context = g_object_ref (remote_desktop->context);
+      deferred->invocation = invocation;
+      g_task_set_task_data (task, deferred, deferred_invocation_free);
+      g_task_run_in_thread (task, dispatch_method_worker);
+    }
+}
+
+static GDBusInterfaceVTable *
+remote_desktop_get_vtable (GDBusInterfaceSkeleton *skeleton)
+{
+  static GDBusInterfaceVTable table;
+  static gsize initialized;
+
+  if (g_once_init_enter (&initialized))
+    {
+      GDBusInterfaceVTable *parent =
+        G_DBUS_INTERFACE_SKELETON_CLASS (remote_desktop_parent_class)->get_vtable (skeleton);
+      table = *parent;
+      parent_method_call = table.method_call;
+      table.method_call = remote_desktop_method_call;
+      g_once_init_leave (&initialized, 1);
+    }
+  return &table;
+}
+
 static void
 remote_desktop_class_init (RemoteDesktopClass *klass)
 {
   GObjectClass *object_class = G_OBJECT_CLASS (klass);
 
   object_class->dispose = remote_desktop_dispose;
+  G_DBUS_INTERFACE_SKELETON_CLASS (klass)->get_vtable = remote_desktop_get_vtable;
 }
 
 static RemoteDesktop *
@@ -1713,5 +1931,5 @@ init_remote_desktop (XdpContext *context)
 
   xdp_context_take_and_export_portal (context,
                                       G_DBUS_INTERFACE_SKELETON (g_steal_pointer (&remote_desktop)),
-                                      XDP_CONTEXT_EXPORT_FLAGS_NONE);
+                                      XDP_CONTEXT_EXPORT_FLAGS_CUSTOM_DISPATCH);
 }
