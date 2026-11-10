@@ -45,6 +45,10 @@ typedef struct _XdpSession
 
   char *impl_dbus_name;
   GDBusConnection *impl_connection;
+  GDBusProxy *impl_name_watch;
+  char *impl_owner;
+  gint impl_owner_lost;
+  gint impl_was_exported;
   XdpDbusImplSession *impl_session;
 } XdpSession;
 
