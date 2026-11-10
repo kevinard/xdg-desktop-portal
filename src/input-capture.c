@@ -1334,26 +1334,9 @@ handle_release (XdpDbusInputCapture   *object,
       return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
-  /* We need to be lenient, a caller may call Release() before processing a
-   * Deactivated/Disabled signal. So we pretend everything's ok but only
-   * update our internal state in the right transitions.
+  /* A stale activation ID can make Release() fail. Keep the current phase
+   * until the implementation confirms Deactivated or Disabled.
    */
-  switch (input_capture_session->state)
-    {
-      case INPUT_CAPTURE_SESSION_STATE_ENABLED:
-        break;
-      case INPUT_CAPTURE_SESSION_STATE_ACTIVE:
-        input_capture_session->state = INPUT_CAPTURE_SESSION_STATE_ENABLED;
-        break;
-      case INPUT_CAPTURE_SESSION_STATE_DISABLED:
-        break;
-      case INPUT_CAPTURE_SESSION_STATE_INIT:
-      case INPUT_CAPTURE_SESSION_STATE_STARTED:
-      case INPUT_CAPTURE_SESSION_STATE_CLOSED:
-        /* ignore, handled above */
-        g_assert_not_reached ();
-    }
-
   xdp_dbus_impl_input_capture_call_release (input_capture->impl,
                                             arg_session_handle,
                                             xdp_app_info_get_id (app_info),
